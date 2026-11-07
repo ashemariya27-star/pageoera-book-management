@@ -1,8 +1,12 @@
 # Python
 __pycache__/
 *.py[cod]
+*.pyo
+.venv/
+venv/
 backend/.venv/
 backend/.env
+.env
 
 # JavaScript
 frontend/node_modules/
@@ -12,3 +16,7 @@ frontend/.env
 # Local editor and OS files
 .vscode/
 Thumbs.db
+.DS_Store
+
+# Logs
+*.log

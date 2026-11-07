@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+backend/.venv/
+backend/.env
+
+# JavaScript
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+
+# Local editor and OS files
+.vscode/
+Thumbs.db

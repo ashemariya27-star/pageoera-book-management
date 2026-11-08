@@ -7,7 +7,7 @@ from sqlalchemy import inspect, select, text
 from sqlalchemy.orm import Session
 
 from .database import Base, engine, get_db
-from .book_catalog import find_book_metadata
+from .book_catalog import find_book_metadata, find_genre_recommendations
 from .models import Book
 from .schemas import BookCreate, BookRead, BookUpdate
 
@@ -94,6 +94,20 @@ def book_metadata(
 ):
     try:
         return find_book_metadata(title.strip(), author.strip())
+    except RuntimeError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+
+
+@app.get("/api/recommendations")
+def book_recommendations(
+    genre: str = Query(min_length=1, max_length=80),
+    limit: int = Query(default=8, ge=1, le=12),
+):
+    cleaned_genre = genre.strip()
+    if not cleaned_genre:
+        raise HTTPException(status_code=422, detail="Genre cannot be blank.")
+    try:
+        return find_genre_recommendations(cleaned_genre, limit)
     except RuntimeError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
 

@@ -31,7 +31,7 @@ def find_book_metadata(title: str, author: str) -> dict:
     params = urlencode(
         {
             "title": title,
-            "fields": "key,title,author_name,cover_i",
+            "fields": "key,title,author_name,cover_i,first_publish_year,number_of_pages_median",
             "limit": 50,
         }
     )
@@ -79,6 +79,7 @@ def find_book_metadata(title: str, author: str) -> dict:
         return {"matched": False}
 
     cover_id = match.get("cover_i")
+    work = {}
     try:
         work = _fetch_json(f"https://openlibrary.org{work_key}.json")
         if not cover_id:
@@ -87,10 +88,94 @@ def find_book_metadata(title: str, author: str) -> dict:
     except RuntimeError:
         logger.warning("Could not retrieve Open Library work details for %s.", work_key)
 
+    description = work.get("description", "")
+    if isinstance(description, dict):
+        description = description.get("value", "")
+    if not isinstance(description, str):
+        description = ""
+
+    total_pages = match.get("number_of_pages_median")
+    if not isinstance(total_pages, int) or isinstance(total_pages, bool) or total_pages < 1:
+        total_pages = None
+
+    published_year = match.get("first_publish_year")
+    if not isinstance(published_year, int) or isinstance(published_year, bool):
+        published_year = None
+
     return {
         "matched": True,
         "title": match["title"],
         "author": match["author_name"][0],
         "cover_url": f"https://covers.openlibrary.org/b/id/{cover_id}-M.jpg" if cover_id else None,
         "source_url": f"https://openlibrary.org{work_key}",
+        "description": description.strip()[:2000],
+        "total_pages": total_pages,
+        "published_year": published_year,
     }
+
+
+def find_genre_recommendations(genre: str, limit: int = 8) -> list[dict]:
+    params = urlencode(
+        {
+            "subject": genre,
+            "fields": "key,title,author_name,cover_i,first_publish_year",
+            "limit": min(limit * 3, 40),
+        }
+    )
+    results = _fetch_json(f"https://openlibrary.org/search.json?{params}")
+    recommendations = []
+    seen_titles = set()
+
+    documents = results.get("docs", [])
+    if not isinstance(documents, list):
+        logger.warning("Open Library returned an unexpected recommendations result.")
+        return recommendations
+
+    for book in documents:
+        if not isinstance(book, dict):
+            continue
+        work_key = book.get("key", "")
+        title = book.get("title", "")
+        authors = book.get("author_name") or []
+        if (
+            not isinstance(work_key, str)
+            or not re.fullmatch(r"/works/OL\d+W", work_key)
+            or not isinstance(title, str)
+            or not title.strip()
+            or not isinstance(authors, list)
+            or not authors
+            or not isinstance(authors[0], str)
+            or not authors[0].strip()
+        ):
+            continue
+
+        normalized_title = _normalized(title)
+        if not normalized_title or normalized_title in seen_titles:
+            continue
+        seen_titles.add(normalized_title)
+
+        cover_id = book.get("cover_i")
+        cover_url = (
+            f"https://covers.openlibrary.org/b/id/{cover_id}-M.jpg"
+            if isinstance(cover_id, int) and not isinstance(cover_id, bool) and cover_id > 0
+            else None
+        )
+        first_publish_year = book.get("first_publish_year")
+        recommendations.append(
+            {
+                "title": title.strip()[:200],
+                "author": authors[0].strip()[:160],
+                "genre": genre,
+                "cover_url": cover_url,
+                "source_url": f"https://openlibrary.org{work_key}",
+                "first_publish_year": (
+                    first_publish_year
+                    if isinstance(first_publish_year, int) and not isinstance(first_publish_year, bool)
+                    else None
+                ),
+            }
+        )
+        if len(recommendations) == limit:
+            break
+
+    return recommendations

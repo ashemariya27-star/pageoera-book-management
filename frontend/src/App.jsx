@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  ArrowRight,
   BookHeart,
   BookMarked,
   BookOpen,
@@ -7,6 +8,8 @@ import {
   Check,
   ChevronDown,
   CircleHelp,
+  Compass,
+  ExternalLink,
   Heart,
   House,
   Library,
@@ -14,6 +17,7 @@ import {
   Moon,
   Pencil,
   Plus,
+  RefreshCw,
   Search,
   Settings,
   Sparkles,
@@ -23,7 +27,7 @@ import {
   X,
 } from "lucide-react";
 
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000/api";
+const API_URL = import.meta.env.VITE_API_URL || "/api";
 const EMPTY_FORM = {
   title: "",
   author: "",
@@ -43,15 +47,44 @@ const NAV_ITEMS = [
   { label: "Dashboard", icon: House },
   { label: "My Books", icon: Library },
   { label: "Reading List", icon: ListChecks },
+  { label: "Discover", icon: Compass },
   { label: "Favourites", icon: Heart },
   { label: "Settings", icon: Settings },
 ];
 
 async function request(path, options = {}) {
-  const response = await fetch(`${API_URL}${path}`, {
-    headers: { "Content-Type": "application/json", ...options.headers },
-    ...options,
-  });
+  const { signal: callerSignal, ...fetchOptions } = options;
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeoutId = window.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, 15000);
+  const abortRequest = () => controller.abort();
+  callerSignal?.addEventListener("abort", abortRequest, { once: true });
+  if (callerSignal?.aborted) abortRequest();
+
+  let response;
+  try {
+    response = await fetch(`${API_URL}${path}`, {
+      ...fetchOptions,
+      headers: { "Content-Type": "application/json", ...options.headers },
+      signal: controller.signal,
+    });
+  } catch (requestError) {
+    if (timedOut) {
+      throw new Error("The Pageora API timed out. Check that the backend and database are running, then try again.");
+    }
+    if (callerSignal?.aborted) throw requestError;
+    if (requestError instanceof TypeError) {
+      throw new Error("Could not reach the Pageora API. Check the API URL, backend, and database connection.");
+    }
+    throw requestError;
+  } finally {
+    window.clearTimeout(timeoutId);
+    callerSignal?.removeEventListener("abort", abortRequest);
+  }
+
   if (!response.ok) {
     let message = `Request failed (${response.status}).`;
     try {
@@ -62,9 +95,114 @@ async function request(path, options = {}) {
     } catch {
       // Keep the HTTP status message when the server does not return JSON.
     }
-    throw new Error(message);
+    const requestError = new Error(message);
+    requestError.status = response.status;
+    throw requestError;
   }
   return response.status === 204 ? null : response.json();
+}
+
+async function fetchOpenLibraryJSON(url, signal) {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeoutId = window.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, 10000);
+  const abortRequest = () => controller.abort();
+  signal?.addEventListener("abort", abortRequest, { once: true });
+
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) {
+      throw new Error(`Open Library request failed (${response.status}).`);
+    }
+    return await response.json();
+  } catch (requestError) {
+    if (timedOut) {
+      throw new Error("Open Library did not respond in time. Please retry the catalog lookup.");
+    }
+    throw requestError;
+  } finally {
+    window.clearTimeout(timeoutId);
+    signal?.removeEventListener("abort", abortRequest);
+  }
+}
+
+async function enrichCatalogMetadata(metadata, signal) {
+  if (!metadata.matched || (metadata.description && metadata.published_year && metadata.total_pages)) {
+    return metadata;
+  }
+
+  const source = new URL(metadata.source_url);
+  if (source.hostname !== "openlibrary.org" || !/^\/works\/OL\d+W$/.test(source.pathname)) {
+    throw new Error("The catalog returned an invalid book details link.");
+  }
+
+  const params = new URLSearchParams({
+    title: metadata.title,
+    author: metadata.author,
+    fields: "key,first_publish_year,number_of_pages_median",
+    limit: "50",
+  });
+  const [work, search] = await Promise.all([
+    fetchOpenLibraryJSON(`https://openlibrary.org${source.pathname}.json`, signal),
+    fetchOpenLibraryJSON(`https://openlibrary.org/search.json?${params}`, signal),
+  ]);
+  const matchingEdition = search.docs?.find((book) => book.key === source.pathname);
+  const description = typeof work.description === "string"
+    ? work.description
+    : typeof work.description?.value === "string"
+      ? work.description.value
+      : "";
+
+  return {
+    ...metadata,
+    description: metadata.description || description.slice(0, 2000),
+    published_year: metadata.published_year || matchingEdition?.first_publish_year || null,
+    total_pages: metadata.total_pages || matchingEdition?.number_of_pages_median || null,
+  };
+}
+
+async function findOpenLibraryRecommendations(genre, signal) {
+  const params = new URLSearchParams({
+    subject: genre,
+    fields: "key,title,author_name,cover_i,first_publish_year",
+    limit: "24",
+  });
+  const results = await fetchOpenLibraryJSON(`https://openlibrary.org/search.json?${params}`, signal);
+  if (!Array.isArray(results.docs)) {
+    throw new Error("Open Library returned an unexpected recommendations response.");
+  }
+
+  const seenTitles = new Set();
+  return results.docs.flatMap((book) => {
+    if (
+      typeof book.key !== "string"
+      || !/^\/works\/OL\d+W$/.test(book.key)
+      || typeof book.title !== "string"
+      || !book.title.trim()
+      || !Array.isArray(book.author_name)
+      || typeof book.author_name[0] !== "string"
+      || !book.author_name[0].trim()
+    ) {
+      return [];
+    }
+
+    const normalizedTitle = book.title.trim().toLocaleLowerCase();
+    if (seenTitles.has(normalizedTitle)) return [];
+    seenTitles.add(normalizedTitle);
+    return [{
+      title: book.title.trim().slice(0, 200),
+      author: book.author_name[0].trim().slice(0, 160),
+      genre,
+      cover_url: Number.isInteger(book.cover_i) && book.cover_i > 0
+        ? `https://covers.openlibrary.org/b/id/${book.cover_i}-M.jpg`
+        : null,
+      source_url: `https://openlibrary.org${book.key}`,
+      first_publish_year: Number.isInteger(book.first_publish_year) ? book.first_publish_year : null,
+    }];
+  });
 }
 
 function App() {
@@ -73,17 +211,25 @@ function App() {
   const [statusFilter, setStatusFilter] = useState("All");
   const [genreFilter, setGenreFilter] = useState("All genres");
   const [ratingFilter, setRatingFilter] = useState("Any rating");
+  const [sortBy, setSortBy] = useState("recent");
+  const [recommendationGenre, setRecommendationGenre] = useState("auto");
+  const [recommendationRefresh, setRecommendationRefresh] = useState(0);
+  const [recommendations, setRecommendations] = useState([]);
+  const [recommendationsLoading, setRecommendationsLoading] = useState(false);
+  const [recommendationsError, setRecommendationsError] = useState("");
   const [search, setSearch] = useState("");
   const [darkMode, setDarkMode] = useState(() => localStorage.getItem("pageora-theme") === "dark");
   const [modalOpen, setModalOpen] = useState(false);
   const [editingBook, setEditingBook] = useState(null);
   const [form, setForm] = useState(EMPTY_FORM);
   const [loading, setLoading] = useState(true);
+  const [apiConnected, setApiConnected] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [lookupLoading, setLookupLoading] = useState(false);
   const [lookupError, setLookupError] = useState("");
   const [lookupMessage, setLookupMessage] = useState("");
+  const [catalogDetails, setCatalogDetails] = useState(null);
   const [lookupAttempt, setLookupAttempt] = useState(0);
   const attemptedLookups = useRef(new Set());
 
@@ -92,7 +238,9 @@ function App() {
     setError("");
     try {
       setBooks(await request("/books"));
+      setApiConnected(true);
     } catch (loadError) {
+      setApiConnected(false);
       setError(`${loadError.message} Make sure the API and PostgreSQL are running.`);
     } finally {
       setLoading(false);
@@ -107,6 +255,52 @@ function App() {
     localStorage.setItem("pageora-theme", darkMode ? "dark" : "light");
   }, [darkMode]);
 
+  const preferredGenres = useMemo(() => {
+    const counts = new Map();
+    books.forEach((book) => {
+      const genre = book.genre.trim();
+      if (genre && genre.toLocaleLowerCase() !== "general") {
+        counts.set(genre, (counts.get(genre) || 0) + 1);
+      }
+    });
+    return [...counts]
+      .sort((first, second) => second[1] - first[1] || first[0].localeCompare(second[0]))
+      .map(([genre, count]) => ({ genre, count }));
+  }, [books]);
+  const selectedRecommendationGenre = preferredGenres.some(({ genre }) => genre === recommendationGenre)
+    ? recommendationGenre
+    : preferredGenres[0]?.genre || "";
+
+  useEffect(() => {
+    if (!selectedRecommendationGenre) {
+      setRecommendations([]);
+      setRecommendationsError("");
+      setRecommendationsLoading(false);
+      return undefined;
+    }
+
+    const controller = new AbortController();
+    const params = new URLSearchParams({ genre: selectedRecommendationGenre });
+    setRecommendationsLoading(true);
+    setRecommendationsError("");
+    request(`/recommendations?${params}`, { signal: controller.signal })
+      .catch((recommendationError) => {
+        if (recommendationError.status !== 404) throw recommendationError;
+        return findOpenLibraryRecommendations(selectedRecommendationGenre, controller.signal);
+      })
+      .then((items) => setRecommendations(items))
+      .catch((recommendationError) => {
+        if (!controller.signal.aborted) {
+          setRecommendationsError(recommendationError.message);
+        }
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setRecommendationsLoading(false);
+      });
+
+    return () => controller.abort();
+  }, [recommendationRefresh, selectedRecommendationGenre]);
+
   const completedCount = books.filter((book) => book.status === "Read").length;
   const readingCount = books.filter((book) => book.status === "Reading").length;
   const toReadCount = books.filter((book) => book.status === "To Read").length;
@@ -115,7 +309,7 @@ function App() {
 
   const visibleBooks = useMemo(() => {
     const query = search.trim().toLocaleLowerCase();
-    return books.filter((book) => {
+    const filteredBooks = books.filter((book) => {
       const matchesSection =
         activeSection === "Favourites"
           ? book.favorite
@@ -128,7 +322,17 @@ function App() {
       const matchesSearch = !query || [book.title, book.author].some((value) => value.toLocaleLowerCase().includes(query));
       return matchesSection && matchesStatus && matchesGenre && matchesRating && matchesSearch;
     });
-  }, [activeSection, books, genreFilter, ratingFilter, search, statusFilter]);
+    return filteredBooks.sort((first, second) => {
+      if (sortBy === "title") {
+        return first.title.localeCompare(second.title, undefined, { sensitivity: "base", numeric: true });
+      }
+      if (sortBy === "rating") {
+        return second.rating - first.rating
+          || first.title.localeCompare(second.title, undefined, { sensitivity: "base", numeric: true });
+      }
+      return new Date(second.created_at) - new Date(first.created_at);
+    });
+  }, [activeSection, books, genreFilter, ratingFilter, search, sortBy, statusFilter]);
 
   const recentBooks = useMemo(
     () => [...books].sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, 3),
@@ -153,12 +357,28 @@ function App() {
     setLookupLoading(false);
     setLookupError("");
     setLookupMessage("");
+    setCatalogDetails(null);
   }
 
   function openAddModal() {
     resetLookup();
     setEditingBook(null);
     setForm({ ...EMPTY_FORM });
+    setError("");
+    setModalOpen(true);
+  }
+
+  function openRecommendation(recommendation) {
+    resetLookup();
+    setEditingBook(null);
+    setForm({
+      ...EMPTY_FORM,
+      title: recommendation.title,
+      author: recommendation.author,
+      genre: recommendation.genre || selectedRecommendationGenre || "General",
+      cover_url: recommendation.cover_url,
+      source_url: recommendation.source_url,
+    });
     setError("");
     setModalOpen(true);
   }
@@ -199,13 +419,23 @@ function App() {
       setLookupMessage("");
       try {
         const params = new URLSearchParams({ title, author });
-        const metadata = await request(`/book-metadata?${params}`, { signal: controller.signal });
+        const catalogMatch = await request(`/book-metadata?${params}`, { signal: controller.signal });
         if (controller.signal.aborted) return;
         attemptedLookups.current.add(key);
-        if (!metadata.matched) {
+        if (!catalogMatch.matched) {
+          setCatalogDetails(null);
           setLookupMessage("We could not confirm this exact title and author, so no cover was added. Check spelling or continue manually.");
           return;
         }
+        let metadata = catalogMatch;
+        try {
+          metadata = await enrichCatalogMetadata(catalogMatch, controller.signal);
+        } catch (detailsError) {
+          if (controller.signal.aborted) return;
+          setLookupError(`${detailsError.message} The verified title and cover are still available.`);
+        }
+        if (controller.signal.aborted) return;
+        setCatalogDetails(metadata);
         attemptedLookups.current.add(`${metadata.title.toLocaleLowerCase()}|${metadata.author.toLocaleLowerCase()}`);
         setForm((current) => ({
           ...current,
@@ -309,6 +539,13 @@ function App() {
     setSearch("");
     setGenreFilter("All genres");
     setRatingFilter("Any rating");
+    setSortBy("recent");
+  }
+
+  function navigateToBooks(status = "All", sort = "recent") {
+    navigate("My Books");
+    setStatusFilter(status);
+    setSortBy(sort);
   }
 
   const titles = {
@@ -316,6 +553,7 @@ function App() {
     "My Books": ["My Books", "Every book you have collected, all in one place."],
     "Reading List": ["Reading List", "The stories waiting for you and the ones in progress."],
     Favourites: ["Favourites", "The books closest to your heart."],
+    Discover: ["Discover your next read", "Thoughtful picks inspired by the genres on your shelf."],
     Settings: ["Settings", "Make Pageora feel like your own."],
   };
   const isLibraryView = ["My Books", "Reading List", "Favourites"].includes(activeSection);
@@ -352,7 +590,10 @@ function App() {
 
       <div className="workspace">
         <header className="topbar">
-          <div className="topbar-caption"><span className="online-dot" /> YOUR PERSONAL LIBRARY</div>
+          <div className={`topbar-caption ${apiConnected ? "api-connected" : loading ? "api-connecting" : "api-disconnected"}`}>
+            <span className="online-dot" />
+            {loading ? "CONNECTING TO YOUR LIBRARY" : apiConnected ? "YOUR PERSONAL LIBRARY" : "LIBRARY CONNECTION ISSUE"}
+          </div>
           <div className="topbar-right">
             <span className="reader-pill"><Library size={15} /> My bookshelf</span>
             <span className="avatar">P</span>
@@ -398,12 +639,36 @@ function App() {
               favoriteCount={favoriteCount}
               monthlyActivity={monthlyActivity}
               maxActivity={maxActivity}
+              preferredGenres={preferredGenres}
+              recommendationGenre={selectedRecommendationGenre}
+              onRecommendationGenreChange={setRecommendationGenre}
+              recommendations={recommendations}
+              recommendationsLoading={recommendationsLoading}
+              recommendationsError={recommendationsError}
+              onRefreshRecommendations={() => setRecommendationRefresh((count) => count + 1)}
+              onAddRecommendation={openRecommendation}
+              onOpenDiscover={() => navigate("Discover")}
               onOpenBooks={() => navigate("My Books")}
+              onOpenBooksFiltered={navigateToBooks}
+              onOpenFavourites={() => navigate("Favourites")}
               onAdd={openAddModal}
               onEdit={openEditModal}
               onDelete={removeBook}
               onToggle={toggleRead}
               onFavorite={(book) => updateBook(book, { favorite: !book.favorite })}
+            />
+          ) : activeSection === "Discover" ? (
+            <DiscoverView
+              preferredGenres={preferredGenres}
+              recommendationGenre={selectedRecommendationGenre}
+              onRecommendationGenreChange={setRecommendationGenre}
+              recommendations={recommendations}
+              books={books}
+              loading={recommendationsLoading}
+              error={recommendationsError}
+              onRefresh={() => setRecommendationRefresh((count) => count + 1)}
+              onAddRecommendation={openRecommendation}
+              onAddBook={openAddModal}
             />
           ) : (
             <LibraryView
@@ -419,6 +684,8 @@ function App() {
               setGenreFilter={setGenreFilter}
               ratingFilter={ratingFilter}
               setRatingFilter={setRatingFilter}
+              sortBy={sortBy}
+              setSortBy={setSortBy}
               genreOptions={genreOptions}
               completedCount={completedCount}
               readingCount={readingCount}
@@ -443,7 +710,11 @@ function App() {
           saving={saving}
           lookupLoading={lookupLoading}
           lookupError={lookupError}
+          setLookupError={setLookupError}
           lookupMessage={lookupMessage}
+          setLookupMessage={setLookupMessage}
+          catalogDetails={catalogDetails}
+          setCatalogDetails={setCatalogDetails}
           onRetry={retryLookup}
           onClose={() => setModalOpen(false)}
           onSave={saveBook}
@@ -455,17 +726,47 @@ function App() {
 
 function Dashboard({
   books, loading, completedCount, readingCount, toReadCount, favoriteCount,
-  monthlyActivity, maxActivity, onOpenBooks, onAdd, onEdit, onDelete, onToggle, onFavorite,
+  monthlyActivity, maxActivity, preferredGenres, recommendationGenre, onRecommendationGenreChange,
+  recommendations, recommendationsLoading, recommendationsError, onRefreshRecommendations,
+  onAddRecommendation, onOpenDiscover, onOpenBooks, onOpenBooksFiltered, onOpenFavourites,
+  onAdd, onEdit, onDelete, onToggle, onFavorite,
 }) {
   const recentBooks = [...books].sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, 3);
   return (
     <>
+      <section className="dashboard-hero">
+        <div className="hero-copy">
+          <p className="hero-eyebrow"><Sparkles size={14} /> YOUR READING JOURNEY</p>
+          <h2>A good book makes room for a new world.</h2>
+          <p>Your shelf is growing. Find your next favorite, or settle into the story you are reading now.</p>
+          <div className="hero-actions">
+            <button className="hero-primary" onClick={onOpenDiscover}>Find my next read <ArrowRight size={16} /></button>
+            <button className="hero-secondary" onClick={onOpenBooks}>Explore my shelf</button>
+          </div>
+        </div>
+        <div className="hero-art" aria-hidden="true">
+          <span className="hero-orbit hero-orbit-one" />
+          <span className="hero-orbit hero-orbit-two" />
+          <div className="hero-books">
+            {books.slice(0, 3).map((book, index) => (
+              <div className={`hero-book hero-book-${index + 1}`} key={book.id}>
+                {book.cover_url
+                  ? <img src={book.cover_url} alt="" />
+                  : <span>{book.title.slice(0, 1).toLocaleUpperCase()}</span>}
+              </div>
+            ))}
+            {!books.length && <div className="hero-book hero-book-placeholder"><BookOpen size={35} /></div>}
+          </div>
+          <div className="hero-book-count"><BookOpen size={14} /><span><strong>{books.length}</strong> {books.length === 1 ? "book" : "books"} on your shelf</span></div>
+        </div>
+      </section>
+
       <section className="stats-grid" aria-label="Reading statistics">
-        <StatCard icon={<Library />} number={books.length} label="TOTAL BOOKS" tone="terracotta" />
-        <StatCard icon={<BookOpen />} number={readingCount} label="CURRENTLY READING" tone="sage" />
-        <StatCard icon={<Check />} number={completedCount} label="COMPLETED" tone="cream" />
-        <StatCard icon={<Star />} number={averageRating(books)} label="AVERAGE RATING" tone="rose" />
-        <StatCard icon={<Heart />} number={favoriteCount} label="FAVOURITES" tone="sage" />
+        <StatCard icon={<Library />} number={books.length} label="TOTAL BOOKS" tone="terracotta" onClick={onOpenBooks} />
+        <StatCard icon={<BookOpen />} number={readingCount} label="CURRENTLY READING" tone="sage" onClick={() => onOpenBooksFiltered("Reading")} />
+        <StatCard icon={<Check />} number={completedCount} label="COMPLETED" tone="cream" onClick={() => onOpenBooksFiltered("Read")} />
+        <StatCard icon={<Star />} number={averageRating(books)} label="AVERAGE RATING" tone="rose" onClick={() => onOpenBooksFiltered("All", "rating")} />
+        <StatCard icon={<Heart />} number={favoriteCount} label="FAVOURITES" tone="sage" onClick={onOpenFavourites} />
       </section>
 
       <section className="dashboard-grid">
@@ -495,6 +796,21 @@ function Dashboard({
         </div>
       </section>
 
+      <RecommendationShelf
+        compact
+        preferredGenres={preferredGenres}
+        genre={recommendationGenre}
+        onGenreChange={onRecommendationGenreChange}
+        recommendations={recommendations}
+        books={books}
+        loading={recommendationsLoading}
+        error={recommendationsError}
+        onRefresh={onRefreshRecommendations}
+        onAddRecommendation={onAddRecommendation}
+        onOpenDiscover={onOpenDiscover}
+        onAddBook={onAdd}
+      />
+
       <section className="panel recent-panel">
         <div className="panel-heading">
           <div><h2><BookMarked size={19} /> Recently added</h2><p>Your latest additions to the shelf.</p></div>
@@ -514,9 +830,142 @@ function Dashboard({
   );
 }
 
+function DiscoverView({
+  preferredGenres, recommendationGenre, onRecommendationGenreChange, recommendations,
+  books, loading, error, onRefresh, onAddRecommendation, onAddBook,
+}) {
+  return (
+    <div className="discover-page">
+      <section className="discover-intro">
+        <div className="discover-intro-icon"><Compass size={22} /></div>
+        <div>
+          <p className="eyebrow">A LITTLE SERENDIPITY</p>
+          <h2>Stories picked for your kind of shelf.</h2>
+          <p>We look at the genres you read and find fresh titles from the Open Library catalog.</p>
+        </div>
+        {preferredGenres.length > 0 && (
+          <label className="discover-genre-picker">
+            <span>Explore a genre</span>
+            <select
+              value={recommendationGenre}
+              onChange={(event) => onRecommendationGenreChange(event.target.value)}
+            >
+              {preferredGenres.map(({ genre, count }) => (
+                <option key={genre} value={genre}>{genre} · {count} {count === 1 ? "book" : "books"}</option>
+              ))}
+            </select>
+            <ChevronDown size={15} />
+          </label>
+        )}
+      </section>
+      <RecommendationShelf
+        preferredGenres={preferredGenres}
+        genre={recommendationGenre}
+        onGenreChange={onRecommendationGenreChange}
+        recommendations={recommendations}
+        books={books}
+        loading={loading}
+        error={error}
+        onRefresh={onRefresh}
+        onAddRecommendation={onAddRecommendation}
+        onAddBook={onAddBook}
+      />
+      <p className="discover-attribution">Book details and cover images provided by <a href="https://openlibrary.org/" target="_blank" rel="noreferrer">Open Library <ExternalLink size={12} /></a>.</p>
+    </div>
+  );
+}
+
+function RecommendationShelf({
+  compact = false, preferredGenres, genre, onGenreChange, recommendations, books,
+  loading, error, onRefresh, onAddRecommendation, onOpenDiscover, onAddBook,
+}) {
+  const ownedBooks = new Set(
+    books.map((book) => `${book.title.trim().toLocaleLowerCase()}|${book.author.trim().toLocaleLowerCase()}`),
+  );
+  const freshRecommendations = recommendations.filter(
+    (book) => !ownedBooks.has(`${book.title.trim().toLocaleLowerCase()}|${book.author.trim().toLocaleLowerCase()}`),
+  );
+  const shownRecommendations = compact ? freshRecommendations.slice(0, 3) : freshRecommendations;
+
+  return (
+    <section className={`recommendations-panel ${compact ? "recommendations-compact" : ""}`}>
+      <div className="recommendations-heading">
+        <div className="recommendations-title">
+          <span className="recommendations-icon"><Sparkles size={17} /></span>
+          <div>
+            <p className="recommendations-kicker">CURATED FOR YOUR TASTE</p>
+            <h2>{genre ? `Because you read ${genre}` : "Your next favorite starts here"}</h2>
+            <p>{genre ? "Fresh finds inspired by the books on your shelf." : "Add a book in a genre you love to unlock your personal picks."}</p>
+          </div>
+        </div>
+        <div className="recommendations-tools">
+          {compact && preferredGenres.length > 1 && (
+            <label className="recommendation-genre-select">
+              <span className="visually-hidden">Recommendation genre</span>
+              <select value={genre} onChange={(event) => onGenreChange(event.target.value)}>
+                {preferredGenres.map(({ genre: option }) => <option value={option} key={option}>{option}</option>)}
+              </select>
+              <ChevronDown size={14} />
+            </label>
+          )}
+          {genre && (
+            <button className="recommendation-refresh" onClick={onRefresh} disabled={loading} aria-label="Refresh recommendations" title="Refresh recommendations">
+              <RefreshCw size={15} className={loading ? "is-spinning" : ""} />
+            </button>
+          )}
+          {compact && <button className="text-button recommendations-all" onClick={onOpenDiscover}>Explore all <ArrowRight size={15} /></button>}
+        </div>
+      </div>
+
+      {!genre ? (
+        <div className="recommendations-empty">
+          <span className="recommendations-empty-icon"><BookOpen size={22} /></span>
+          <div><strong>Start with a genre you love.</strong><p>Once you add a book, we will find more stories in that world.</p></div>
+          <button className="secondary-button" onClick={onAddBook}><Plus size={15} /> Add your first book</button>
+        </div>
+      ) : loading ? (
+        <div className="recommendation-status" role="status"><span className="loading-spinner" /> Finding your next great read…</div>
+      ) : error ? (
+        <div className="recommendation-error" role="alert">
+          <span>{error} Please try again.</span>
+          <button className="secondary-button" onClick={onRefresh}><RefreshCw size={14} /> Retry</button>
+        </div>
+      ) : shownRecommendations.length ? (
+        <div className="recommendation-grid">
+          {shownRecommendations.map((book, index) => (
+            <article className={`recommendation-card recommendation-card-${index % 4}`} key={`${book.title}-${book.author}`}>
+              <a className="recommendation-cover" href={book.source_url} target="_blank" rel="noreferrer" aria-label={`View ${book.title} on Open Library`}>
+                {book.cover_url
+                  ? <img src={book.cover_url} alt={`Cover of ${book.title}`} loading="lazy" />
+                  : <span className="recommendation-cover-fallback"><BookOpen size={27} /><strong>{book.title.slice(0, 1).toLocaleUpperCase()}</strong></span>}
+                {book.first_publish_year && <span className="recommendation-year">{book.first_publish_year}</span>}
+              </a>
+              <div className="recommendation-book-info">
+                <span className="genre-label">{book.genre || genre}</span>
+                <h3 title={book.title}>{book.title}</h3>
+                <p>by {book.author}</p>
+                <div className="recommendation-card-actions">
+                  <a href={book.source_url} target="_blank" rel="noreferrer">Details <ExternalLink size={12} /></a>
+                  <button onClick={() => onAddRecommendation(book)}><Plus size={14} /> Add to shelf</button>
+                </div>
+              </div>
+            </article>
+          ))}
+        </div>
+      ) : (
+        <div className="recommendation-status recommendation-no-results">
+          <BookMarked size={19} />
+          <span>We could not find new titles for this genre right now. Try refreshing or exploring another genre.</span>
+        </div>
+      )}
+      <p className="recommendations-credit">Recommendations powered by Open Library</p>
+    </section>
+  );
+}
+
 function LibraryView({
   books, allBooks, activeSection, loading, search, setSearch, statusFilter, setStatusFilter,
-  genreFilter, setGenreFilter, ratingFilter, setRatingFilter, genreOptions, completedCount,
+  genreFilter, setGenreFilter, ratingFilter, setRatingFilter, sortBy, setSortBy, genreOptions, completedCount,
   readingCount, toReadCount, onEdit, onDelete, onToggle, onFavorite, onAdd,
 }) {
   const tabs = [
@@ -544,6 +993,9 @@ function LibraryView({
           <label className="filter-select-label">Rating
             <span className="filter-select-wrap"><select value={ratingFilter} onChange={(event) => setRatingFilter(event.target.value)} aria-label="Filter by minimum rating"><option>Any rating</option><option value="5">5 stars</option><option value="4">4+ stars</option><option value="3">3+ stars</option><option value="2">2+ stars</option></select><ChevronDown size={14} /></span>
           </label>
+          <label className="filter-select-label">Sort by
+            <span className="filter-select-wrap"><select value={sortBy} onChange={(event) => setSortBy(event.target.value)} aria-label="Sort books"><option value="recent">Recently added</option><option value="title">Title A–Z</option><option value="rating">Highest rated</option></select><ChevronDown size={14} /></span>
+          </label>
         </div>
       </div>
       {activeSection === "My Books" && (
@@ -562,18 +1014,40 @@ function LibraryView({
   );
 }
 
-function BookModal({ editingBook, form, setForm, error, saving, lookupLoading, lookupError, lookupMessage, onRetry, onClose, onSave }) {
+function BookModal({
+  editingBook, form, setForm, error, saving, lookupLoading, lookupError, setLookupError,
+  lookupMessage, setLookupMessage, catalogDetails, setCatalogDetails, onRetry, onClose, onSave,
+}) {
   return (
     <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <section className="book-modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
         <div className="modal-header"><div><p className="eyebrow">YOUR PAGEORA SHELF</p><h2 id="modal-title">{editingBook ? "Edit this book" : "Add a new book"}</h2></div><button className="icon-button" onClick={onClose} aria-label="Close dialog"><X size={20} /></button></div>
         <form onSubmit={onSave}>
-          <label className="form-field"><span>Book title <b>*</b></span><input required maxLength={200} autoFocus placeholder="e.g. The Midnight Library" value={form.title} onChange={(event) => { setForm((current) => ({ ...current, title: event.target.value, cover_url: null, source_url: null })); }} /></label>
-          <p className="catalog-hint">Enter a title and author to automatically check for a verified book cover.</p>
+          <label className="form-field"><span>Book title <b>*</b></span><input required maxLength={200} autoFocus placeholder="e.g. The Midnight Library" value={form.title} onChange={(event) => { setCatalogDetails(null); setLookupError(""); setLookupMessage(""); setForm((current) => ({ ...current, title: event.target.value, cover_url: null, source_url: null })); }} /></label>
+          <div className="catalog-hint"><span>Enter a title and author to look up matching catalog details.</span><button type="button" className="catalog-lookup-button" onClick={onRetry} disabled={lookupLoading || form.title.trim().length < 2 || form.author.trim().length < 2}><Search size={13} /> {lookupLoading ? "Looking up…" : "Find book details"}</button></div>
           {lookupLoading && <p className="catalog-message" role="status">Checking the title and author…</p>}
           {lookupMessage && <p className="catalog-message" role="status">{lookupMessage}{form.source_url && <> <a href={form.source_url} target="_blank" rel="noreferrer">Catalog record</a>.</>}</p>}
           {lookupError && <p className="catalog-message catalog-error" role="alert">{lookupError} <button type="button" className="catalog-retry" onClick={onRetry}>Try again</button></p>}
-          <label className="form-field"><span>Author <b>*</b></span><input required maxLength={160} placeholder="e.g. Matt Haig" value={form.author} onChange={(event) => { setForm((current) => ({ ...current, author: event.target.value, cover_url: null, source_url: null })); }} /></label>
+          <label className="form-field"><span>Author <b>*</b></span><input required maxLength={160} placeholder="e.g. Matt Haig" value={form.author} onChange={(event) => { setCatalogDetails(null); setLookupError(""); setLookupMessage(""); setForm((current) => ({ ...current, author: event.target.value, cover_url: null, source_url: null })); }} /></label>
+          {catalogDetails && (
+            <section className="catalog-details" aria-label="Catalog book details">
+              {catalogDetails.cover_url && <img src={catalogDetails.cover_url} alt={`Cover of ${catalogDetails.title}`} />}
+              <div className="catalog-details-copy">
+                <strong>{catalogDetails.title}</strong>
+                <span>by {catalogDetails.author}{catalogDetails.published_year ? ` · ${catalogDetails.published_year}` : ""}</span>
+                {catalogDetails.description && <p>{catalogDetails.description}</p>}
+                <div className="catalog-detail-actions">
+                  {catalogDetails.total_pages && (
+                    <>
+                      <span>About {catalogDetails.total_pages} pages</span>
+                      <button type="button" onClick={() => setForm((current) => ({ ...current, total_pages: String(catalogDetails.total_pages) }))}>Use page estimate</button>
+                    </>
+                  )}
+                  {catalogDetails.source_url && <a href={catalogDetails.source_url} target="_blank" rel="noreferrer">Open Library <ExternalLink size={12} /></a>}
+                </div>
+              </div>
+            </section>
+          )}
           <div className="form-row">
             <label className="form-field"><span>Genre</span><span className="select-wrap"><select value={GENRES.includes(form.genre) ? form.genre : "Other"} onChange={(event) => setForm((current) => ({ ...current, genre: event.target.value === "Other" ? "" : event.target.value }))}>{GENRES.map((genre) => <option key={genre}>{genre}</option>)}<option value="Other">Other / type below</option></select><ChevronDown size={16} /></span>{(!GENRES.includes(form.genre) || form.genre === "") && <input className="genre-custom" maxLength={80} placeholder="Enter a genre" value={form.genre} onChange={(event) => setForm((current) => ({ ...current, genre: event.target.value }))} />}</label>
             <label className="form-field"><span>Your rating</span><span className="select-wrap rating-select"><select value={form.rating} onChange={(event) => setForm((current) => ({ ...current, rating: event.target.value }))}>{[5, 4, 3, 2, 1].map((rating) => <option value={rating} key={rating}>{rating} {rating === 1 ? "star" : "stars"}</option>)}</select><Star size={15} className="select-star" /><ChevronDown size={16} /></span></label>
@@ -594,8 +1068,11 @@ function BookModal({ editingBook, form, setForm, error, saving, lookupLoading, l
   );
 }
 
-function StatCard({ icon, number, label, tone }) {
-  return <div className="stat-card"><div className={`stat-icon ${tone}`}>{icon}</div><div><strong>{number}</strong><span>{label}</span></div></div>;
+function StatCard({ icon, number, label, tone, onClick }) {
+  const contents = <><div className={`stat-icon ${tone}`}>{icon}</div><div><strong>{number}</strong><span>{label}</span></div></>;
+  return onClick
+    ? <button className="stat-card stat-card-button" onClick={onClick} aria-label={`View ${label.toLocaleLowerCase()}`}>{contents}</button>
+    : <div className="stat-card">{contents}</div>;
 }
 
 function BookCard({ book, index, onEdit, onDelete, onToggle, onFavorite }) {

@@ -14,7 +14,11 @@ if not DATABASE_URL:
         "and add your PostgreSQL password."
     )
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    connect_args={"channel_binding": "disable"}
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 

@@ -40,6 +40,8 @@ CREATE DATABASE sample_project_2;
 
 The connection example assumes PostgreSQL is on `localhost:5432`, the username is `postgres`, and its password is `root`. After copying the example file in the next step, replace `YOUR_PASSWORD` with `root` in `backend/.env`. If your PostgreSQL username or password is different, update the URL there. Never put your real password into application source code or commit your `.env` file.
 
+If you want your local website to use your deployed Render database instead, set `DATABASE_URL` in `backend/.env` to the database's **External Database URL** from the Render dashboard.
+
 The backend creates the `books` table the first time it starts. It does not create or change your PostgreSQL user or password.
 
 ## 2. Start the FastAPI backend
@@ -75,7 +77,8 @@ Open the localhost URL printed by Vite (usually `http://localhost:5173`).
 | Method | Route | Purpose |
 | --- | --- | --- |
 | `GET` | `/api/books` | List books |
-| `GET` | `/api/book-metadata?title=...&author=...` | Find a verified catalog cover |
+| `GET` | `/api/book-metadata?title=...&author=...` | Find verified catalog details and a cover |
+| `GET` | `/api/recommendations?genre=...` | Find genre-based book recommendations |
 | `POST` | `/api/books` | Add a book |
 | `PATCH` | `/api/books/{id}` | Edit a book or change its reading status |
 | `DELETE` | `/api/books/{id}` | Remove a book |
@@ -85,13 +88,14 @@ Ratings must be from 1 to 5. A book's status is `To Read`, `Reading`, or `Read`.
 
 ## Automatically find a book cover
 
-When adding or editing a book, enter its title and author. After both fields are entered, Pageora checks the Open Library catalog automatically. It only fills in a cover when the title and author closely match a catalog record; it also corrects the title/author to the catalog spelling. Genre, summary, and personal review remain under your control. You can review or edit the fields before saving.
+When adding or editing a book, enter its title and author. After both fields are entered, Pageora checks the Open Library catalog automatically. It only fills in details when the title and author closely match a catalog record; it also corrects the title/author spelling and displays the catalog description, publication year, page estimate, and cover when available. It fills in a page estimate only when the page field is empty. Your genre, personal notes, and review remain under your control. You can review or edit the fields before saving.
 
 This optional lookup requires an internet connection. If the catalog is unavailable or the match is uncertain, no catalog cover is added and you can enter details manually. Book covers are loaded from Open Library; if a cover is missing or unavailable, the website displays its illustrated fallback cover instead. Existing databases receive new columns for covers, progress, favourites, reviews, and reading dates automatically the next time the backend starts.
 
 ## Pageora features
 
 - Search by book title or author and filter by reading status, genre, and minimum star rating.
+- Discover books from Open Library based on the genres in your collection.
 - Track total pages and pages read. Progress is shown on the book card, and completing the last page marks the book as read.
 - Keep personal star ratings, reading notes, and reviews.
 - Mark favourites and browse the dedicated Favourites page.
